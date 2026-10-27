@@ -18,11 +18,11 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.ToneGenerator
+import android.media.VolumeProvider
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -34,16 +34,16 @@ import android.os.VibratorManager
 import android.provider.MediaStore
 import android.util.Log
 import android.view.KeyEvent
-import java.text.SimpleDateFormat
 import java.util.Date
-import java.util.Locale
 
 /**
- * Runs in the background, listens for the earbud button command
- * (triple tap -> "previous track") and toggles a voice recording.
+ * Runs in the background and toggles a recording when a shortcut arrives:
  *
- * Flow:  earbud tap -> Bluetooth AVRCP command -> Android -> our MediaSession
- *        -> toggle() -> MediaRecorder start/stop -> file in Music/EarTap
+ *   earbud tap      -> Bluetooth media command -> MediaSession callback  -> toggle()
+ *   volume down x3  -> Android volume keys     -> MediaSession volume    -> toggle()
+ *
+ * Both work because EarTap keeps an inaudible sound playing, which makes Android
+ * send media buttons and volume keys to EarTap first.
  */
 class EarTapService : Service() {
 
@@ -51,6 +51,7 @@ class EarTapService : Service() {
         const val ACTION_START = "com.eartap.recorder.START"
         const val ACTION_STOP = "com.eartap.recorder.STOP"
         const val ACTION_TOGGLE = "com.eartap.recorder.TOGGLE"
+        const val ACTION_REFRESH = "com.eartap.recorder.REFRESH"
         const val BROADCAST_STATE = "com.eartap.recorder.STATE"
         private const val CHANNEL_ID = "eartap"
         private const val NOTIF_ID = 1
@@ -59,7 +60,12 @@ class EarTapService : Service() {
 
         @Volatile var isRunning = false
         @Volatile var isRecording = false
+        @Volatile var isStarting = false
         @Volatile var lastKey = "none yet"
+        /** SystemClock.elapsedRealtime() when the current recording started, 0 if none. */
+        @Volatile var recordingStartedAt = 0L
+        @Volatile var currentTitle = ""
+        @Volatile var currentFileName = ""
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -70,9 +76,19 @@ class EarTapService : Service() {
     private var currentUri: Uri? = null
     private var currentPfd: ParcelFileDescriptor? = null
     private var tone: ToneGenerator? = null
+    private var silentTrack: AudioTrack? = null
     private var lastToggleAt = 0L
     private var usingSco = false
     private var pendingStart: Runnable? = null
+    private var recordingWallStart = 0L
+
+    /** Receives the hardware volume keys while EarTap is the active media app. */
+    private val volumeProvider =
+        object : VolumeProvider(VolumeProvider.VOLUME_CONTROL_RELATIVE, 100, 50) {
+            override fun onAdjustVolume(direction: Int) {
+                handler.post { onVolumeKey(direction) }
+            }
+        }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -87,21 +103,38 @@ class EarTapService : Service() {
             setPlaybackState(playingState())
             isActive = true
         }
+        applyVolumeMode()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            isRunning = false
-            stopRecording()
-            stopSilentLoop()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                isRunning = false
+                stopRecording()
+                stopSilentLoop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                broadcastState()
+                return START_NOT_STICKY
+            }
+            ACTION_REFRESH -> {
+                if (isRunning) {
+                    applyVolumeMode()
+                    updateNotification()
+                } else {
+                    stopSelf()
+                }
+                broadcastState()
+                return START_NOT_STICKY
+            }
         }
-        if (!goForeground()) return START_NOT_STICKY
 
-        isRunning = true
-        if (intent?.action == ACTION_TOGGLE) toggle() else claimMediaButtons()
+        if (!isRunning) {
+            if (!goForeground()) return START_NOT_STICKY
+            isRunning = true
+        }
+        claimMediaButtons()
+        if (intent?.action == ACTION_TOGGLE) toggle()
         broadcastState()
         // NOT_STICKY: Android doesn't allow restarting a mic service from the background.
         return START_NOT_STICKY
@@ -119,7 +152,7 @@ class EarTapService : Service() {
         super.onDestroy()
     }
 
-    // ---------------------------------------------------------------- earbud buttons
+    // ---------------------------------------------------------------- shortcuts
 
     private val sessionCallback = object : MediaSession.Callback() {
         override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
@@ -129,14 +162,15 @@ class EarTapService : Service() {
                 @Suppress("DEPRECATION")
                 mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
             }
-            if (ev != null) {
-                lastKey = KeyEvent.keyCodeToString(ev.keyCode) +
-                    (if (ev.action == KeyEvent.ACTION_DOWN) " (down)" else " (up)")
+            if (ev == null) return super.onMediaButtonEvent(mediaButtonIntent)
+
+            val firstDown = ev.action == KeyEvent.ACTION_DOWN && ev.repeatCount == 0
+            if (firstDown) {
+                lastKey = describeKey(ev.keyCode)
                 broadcastState()
             }
-            if (ev != null && isTrigger(ev.keyCode)) {
-                Log.d(TAG, "Trigger key ${KeyEvent.keyCodeToString(ev.keyCode)} action=${ev.action}")
-                if (ev.action == KeyEvent.ACTION_DOWN && ev.repeatCount == 0) toggle()
+            if (Prefs.earbudTrigger(this@EarTapService) && isTrigger(ev.keyCode)) {
+                if (firstDown) toggle()
                 return true // swallow both DOWN and UP
             }
             return super.onMediaButtonEvent(mediaButtonIntent)
@@ -155,6 +189,37 @@ class EarTapService : Service() {
         return keyCode == wanted
     }
 
+    private fun onVolumeKey(direction: Int) {
+        when {
+            direction < 0 -> {
+                lastKey = "Volume down"
+                if (VolumeTrigger.onVolumeDown(audioManager, showUi = true)) toggle()
+            }
+            direction > 0 -> {
+                lastKey = "Volume up"
+                try {
+                    audioManager.adjustStreamVolume(
+                        AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI
+                    )
+                } catch (_: Exception) {
+                }
+            }
+            else -> return
+        }
+        broadcastState()
+    }
+
+    /** Volume shortcut on: EarTap receives the volume keys. Off: keys behave as normal. */
+    private fun applyVolumeMode() {
+        if (Prefs.volumeTrigger(this)) {
+            session.setPlaybackToRemote(volumeProvider)
+        } else {
+            session.setPlaybackToLocal(
+                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build()
+            )
+        }
+    }
+
     private fun playingState(): PlaybackState =
         PlaybackState.Builder()
             .setActions(
@@ -165,11 +230,9 @@ class EarTapService : Service() {
             .setState(PlaybackState.STATE_PLAYING, 0L, 1f)
             .build()
 
-    private var silentTrack: AudioTrack? = null
-
     /**
-     * Android sends earbud buttons to the app that is playing audio right now.
-     * So EarTap plays an inaudible looping sound the whole time it is listening.
+     * Android sends earbud buttons and volume keys to the app that is playing audio
+     * right now. So EarTap plays an inaudible looping sound the whole time it listens.
      */
     private fun claimMediaButtons() {
         session.setPlaybackState(playingState())
@@ -222,11 +285,10 @@ class EarTapService : Service() {
 
     private fun startRecording() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            beep(error = true)
+            signalError()
             return
         }
-        beep(times = 1)
-        vibrate(80)
+        signalStart()
 
         val earbudMic = Prefs.useEarbudMic(this) && routeToEarbudMic()
         val source = if (earbudMic) MediaRecorder.AudioSource.VOICE_COMMUNICATION
@@ -234,20 +296,25 @@ class EarTapService : Service() {
         // Wait for the beep to finish (and for the earbud mic link, which takes ~1.5 s)
         val r = Runnable {
             pendingStart = null
+            isStarting = false
             beginRecorder(source, earbudMic)
         }
         pendingStart = r
+        isStarting = true
         handler.postDelayed(r, if (earbudMic) 1500L else 350L)
         updateNotification()
+        broadcastState()
     }
 
     private fun beginRecorder(source: Int, earbudMic: Boolean) {
-        val name = "EarTap_" +
-            SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date()) + ".m4a"
+        val now = Date()
+        val number = Naming.nextNumber(this, now)
+        val name = Naming.fileName(number, now, Prefs.place(this))
         val values = ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, name)
+            put(MediaStore.Audio.Media.TITLE, name.removeSuffix(".m4a"))
             put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
-            put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/EarTap")
+            put(MediaStore.Audio.Media.RELATIVE_PATH, Naming.folderFor(now))
             put(MediaStore.Audio.Media.IS_PENDING, 1)
         }
 
@@ -266,7 +333,7 @@ class EarTapService : Service() {
             r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             // Bluetooth mic is low bandwidth (16 kHz); phone mic can do 44.1 kHz
             r.setAudioSamplingRate(if (earbudMic) 16000 else 44100)
-            r.setAudioEncodingBitRate(if (earbudMic) 32000 else 96000)
+            r.setAudioEncodingBitRate(if (earbudMic) 32000 else 128000)
             r.setOutputFile(pfd.fileDescriptor)
             r.prepare()
             r.start()
@@ -277,15 +344,20 @@ class EarTapService : Service() {
             uri?.let { contentResolver.delete(it, null, null) }
             releaseSco()
             isRecording = false
-            beep(error = true)
+            signalError()
             updateNotification()
             broadcastState()
             return
         }
 
+        Prefs.setLastNumber(this, Naming.dayKey(now), number)
         recorder = r
         currentUri = uri
         currentPfd = pfd
+        currentTitle = "Interaction $number"
+        currentFileName = name
+        recordingStartedAt = SystemClock.elapsedRealtime()
+        recordingWallStart = System.currentTimeMillis()
         isRecording = true
         updateNotification()
         broadcastState()
@@ -295,6 +367,7 @@ class EarTapService : Service() {
         pendingStart?.let { handler.removeCallbacks(it) }
         val wasActive = isRecording || pendingStart != null
         pendingStart = null
+        isStarting = false
 
         val r = recorder
         recorder = null
@@ -321,12 +394,12 @@ class EarTapService : Service() {
         }
         currentUri = null
         isRecording = false
+        recordingStartedAt = 0L
+        currentTitle = ""
+        currentFileName = ""
         releaseSco()
 
-        if (wasActive) {
-            beep(times = 2)
-            vibrate(200)
-        }
+        if (saved) signalSaved() else if (wasActive) signalError()
         if (isRunning) {
             claimMediaButtons()
             updateNotification()
@@ -378,23 +451,48 @@ class EarTapService : Service() {
     }
 
     // ---------------------------------------------------------------- feedback
+    // Vibration always. Beeps only when earbuds / headphones are connected, so the
+    // phone never beeps out loud in a meeting.
 
-    /** 1 beep = started, 2 beeps = saved, low tone = error. You hear it in the earbuds. */
-    private fun beep(times: Int = 1, error: Boolean = false) {
+    private fun signalStart() {
+        vibrate(longArrayOf(0, 120))
+        beep(ToneGenerator.TONE_PROP_BEEP)
+    }
+
+    private fun signalSaved() {
+        vibrate(longArrayOf(0, 80, 120, 80))
+        beep(ToneGenerator.TONE_PROP_BEEP2)
+    }
+
+    private fun signalError() {
+        vibrate(longArrayOf(0, 400))
+        beep(ToneGenerator.TONE_PROP_NACK)
+    }
+
+    private fun headphonesConnected(): Boolean = try {
+        audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun beep(toneType: Int) {
+        if (!headphonesConnected()) return
         try {
             val tg = tone ?: ToneGenerator(AudioManager.STREAM_MUSIC, 90).also { tone = it }
-            val t = when {
-                error -> ToneGenerator.TONE_PROP_NACK
-                times == 1 -> ToneGenerator.TONE_PROP_BEEP
-                else -> ToneGenerator.TONE_PROP_BEEP2
-            }
-            tg.startTone(t, 300)
+            tg.startTone(toneType, 300)
         } catch (e: Exception) {
             Log.w(TAG, "Beep failed", e)
         }
     }
 
-    private fun vibrate(ms: Long) {
+    private fun vibrate(pattern: LongArray) {
         try {
             val v: Vibrator = if (Build.VERSION.SDK_INT >= 31) {
                 getSystemService(VibratorManager::class.java).defaultVibrator
@@ -402,7 +500,7 @@ class EarTapService : Service() {
                 @Suppress("DEPRECATION")
                 getSystemService(Vibrator::class.java)
             }
-            v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+            v.vibrate(VibrationEffect.createWaveform(pattern, -1))
         } catch (_: Exception) {}
     }
 
@@ -410,7 +508,7 @@ class EarTapService : Service() {
 
     private fun createChannel() {
         val ch = NotificationChannel(CHANNEL_ID, "EarTap", NotificationManager.IMPORTANCE_LOW)
-        ch.description = "Shows that EarTap is listening for earbud taps"
+        ch.description = "Shows that EarTap is ready to record"
         getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
     }
 
@@ -431,6 +529,14 @@ class EarTapService : Service() {
         }
     }
 
+    private fun shortcutsText(): String {
+        val parts = mutableListOf<String>()
+        if (Prefs.volumeTrigger(this)) parts += "volume down ×3"
+        if (Prefs.earbudTrigger(this)) parts += "earbud tap"
+        return if (parts.isEmpty()) "Tap Record to start"
+               else "Start with " + parts.joinToString(" or ")
+    }
+
     private fun buildNotification(): Notification {
         val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         val openApp = PendingIntent.getActivity(
@@ -442,21 +548,34 @@ class EarTapService : Service() {
         val offIntent = PendingIntent.getService(
             this, 2, Intent(this, EarTapService::class.java).setAction(ACTION_STOP), flags
         )
-        val icon = Icon.createWithResource(this, R.drawable.ic_mic)
-        val text = when {
-            isRecording -> "● Recording… tap earbuds again to stop"
-            pendingStart != null -> "Starting…"
-            else -> "Listening — tap earbuds to record"
-        }
-        return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_mic)
-            .setContentTitle("EarTap")
-            .setContentText(text)
+        val icon = Icon.createWithResource(this, R.drawable.ic_mic_white)
+
+        val b = Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_mic_white)
             .setContentIntent(openApp)
             .setOngoing(true)
+            .setColor(getColor(if (isRecording) R.color.rec else R.color.primary))
+
+        when {
+            isRecording -> b
+                .setContentTitle("● Recording · $currentTitle")
+                .setContentText("${Prefs.place(this)} · volume down ×3 or Stop to finish")
+                .setUsesChronometer(true)
+                .setWhen(recordingWallStart)
+                .setShowWhen(true)
+            pendingStart != null -> b
+                .setContentTitle("Starting recording…")
+                .setShowWhen(false)
+            else -> b
+                .setContentTitle("EarTap is ready")
+                .setContentText(shortcutsText())
+                .setShowWhen(false)
+        }
+
+        return b
             .addAction(
                 Notification.Action.Builder(
-                    icon, if (isRecording) "Stop recording" else "Record now", toggleIntent
+                    icon, if (isRecording) "Stop" else "Record", toggleIntent
                 ).build()
             )
             .addAction(Notification.Action.Builder(icon, "Turn off", offIntent).build())

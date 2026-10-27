@@ -11,13 +11,28 @@ android {
         applicationId = "com.eartap.recorder"
         minSdk = 30          // Android 11+
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+    }
+
+    // One fixed key for every build, so a new APK installs over the old one
+    // (no more uninstalling). It's a personal sideload key, not a Play Store key.
+    signingConfigs {
+        create("eartap") {
+            storeFile = file("eartap-debug.jks")
+            storePassword = "eartap123"
+            keyAlias = "eartap"
+            keyPassword = "eartap123"
+        }
     }
 
     buildTypes {
-        release {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("eartap")
+        }
+        getByName("release") {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("eartap")
         }
     }
     compileOptions {

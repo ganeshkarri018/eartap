@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#F3F5F9</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="surface_alt">#EEF1F6</color>
+    <color name="outline">#E3E7EE</color>
+    <color name="text_primary">#111827</color>
+    <color name="text_secondary">#5B6475</color>
+    <color name="primary">#2F4BD8</color>
+    <color name="primary_soft">#E6EBFF</color>
+    <color name="rec">#E5383B</color>
+    <color name="rec_soft">#FDE3E3</color>
+    <color name="success">#12805C</color>
+    <color name="success_soft">#DDF3EA</color>
+    <color name="ripple">#1F2F4BD8</color>
+    <color name="white">#FFFFFF</color>
+    <color name="launcher_bg">#2F4BD8</color>
+</resources>
