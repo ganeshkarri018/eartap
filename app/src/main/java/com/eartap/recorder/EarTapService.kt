@@ -53,8 +53,10 @@ class EarTapService : Service() {
         const val ACTION_TOGGLE = "com.eartap.recorder.TOGGLE"
         const val ACTION_REFRESH = "com.eartap.recorder.REFRESH"
         const val BROADCAST_STATE = "com.eartap.recorder.STATE"
+        const val EXTRA_JOURNAL = "journal"
         private const val CHANNEL_ID = "eartap"
         private const val NOTIF_ID = 1
+        private const val SAVED_NOTIF_ID = 2
         private const val TAG = "EarTap"
         private const val DEBOUNCE_MS = 700L
 
@@ -81,6 +83,7 @@ class EarTapService : Service() {
     private var usingSco = false
     private var pendingStart: Runnable? = null
     private var recordingWallStart = 0L
+    private var currentFolder = ""
 
     /** Receives the hardware volume keys while EarTap is the active media app. */
     private val volumeProvider =
@@ -310,11 +313,12 @@ class EarTapService : Service() {
         val now = Date()
         val number = Naming.nextNumber(this, now)
         val name = Naming.fileName(number, now, Prefs.place(this))
+        val folder = Naming.folderFor(now)
         val values = ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, name)
             put(MediaStore.Audio.Media.TITLE, name.removeSuffix(".m4a"))
             put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
-            put(MediaStore.Audio.Media.RELATIVE_PATH, Naming.folderFor(now))
+            put(MediaStore.Audio.Media.RELATIVE_PATH, folder)
             put(MediaStore.Audio.Media.IS_PENDING, 1)
         }
 
@@ -356,6 +360,7 @@ class EarTapService : Service() {
         currentPfd = pfd
         currentTitle = "Interaction $number"
         currentFileName = name
+        currentFolder = folder
         recordingStartedAt = SystemClock.elapsedRealtime()
         recordingWallStart = System.currentTimeMillis()
         isRecording = true
@@ -384,6 +389,13 @@ class EarTapService : Service() {
         try { currentPfd?.close() } catch (_: Exception) {}
         currentPfd = null
 
+        val savedUri = currentUri
+        val savedName = currentFileName
+        val savedTitle = currentTitle
+        val savedFolder = currentFolder
+        val savedStart = recordingWallStart
+        val savedEnd = System.currentTimeMillis()
+
         currentUri?.let { uri ->
             if (saved) {
                 val v = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
@@ -397,14 +409,70 @@ class EarTapService : Service() {
         recordingStartedAt = 0L
         currentTitle = ""
         currentFileName = ""
+        currentFolder = ""
         releaseSco()
 
         if (saved) signalSaved() else if (wasActive) signalError()
+        if (saved && savedUri != null) {
+            val place = Prefs.place(this)
+            Thread {
+                saveEvidence(savedUri, savedName, savedFolder, savedStart, savedEnd, place, savedTitle)
+            }.start()
+        }
         if (isRunning) {
             claimMediaButtons()
             updateNotification()
         }
         broadcastState()
+    }
+
+    // ---------------------------------------------------------------- evidence
+
+    /** Fingerprint the saved file and add it to the timeline. Runs off the main thread. */
+    private fun saveEvidence(
+        uri: Uri, name: String, folder: String, start: Long, end: Long, place: String, title: String
+    ) {
+        val hashed = Integrity.sha256(contentResolver, uri)
+        val e = Journal.byFile(this, name) ?: Entry(kind = Entry.KIND_RECORDING)
+        e.kind = Entry.KIND_RECORDING
+        e.fileName = name
+        e.folder = folder
+        e.time = start
+        e.endTime = end
+        e.durationMs = end - start
+        if (e.place.isBlank()) e.place = place
+        e.sha256 = hashed?.first ?: ""
+        e.sizeBytes = hashed?.second ?: 0L
+        e.hashedAt = System.currentTimeMillis()
+        e.device = Integrity.deviceInfo()
+        Journal.upsert(this, e)
+        broadcastState(journalChanged = true)
+        handler.post { notifySaved(name, title, end - start) }
+    }
+
+    /** "Saved Interaction 3 — tap to add a note" */
+    private fun notifySaved(name: String, title: String, durationMs: Long) {
+        val open = Intent(this, MainActivity::class.java)
+            .putExtra(MainActivity.EXTRA_EDIT_FILE, name)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pi = PendingIntent.getActivity(
+            this, 10, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val length = Report.formatDuration(durationMs)?.let { " ($it)" } ?: ""
+        val n = Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_mic_white)
+            .setContentTitle("Saved $title$length")
+            .setContentText("Tap to tag it and note what happened while it's fresh")
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .addAction(
+                Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_note), "Add note", pi).build()
+            )
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java).notify(SAVED_NOTIF_ID, n)
+        } catch (_: Exception) {
+        }
     }
 
     // ---------------------------------------------------------------- earbud mic (optional)
@@ -587,7 +655,9 @@ class EarTapService : Service() {
         getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
     }
 
-    private fun broadcastState() {
-        sendBroadcast(Intent(BROADCAST_STATE).setPackage(packageName))
+    private fun broadcastState(journalChanged: Boolean = false) {
+        sendBroadcast(
+            Intent(BROADCAST_STATE).setPackage(packageName).putExtra(EXTRA_JOURNAL, journalChanged)
+        )
     }
 }

@@ -11,8 +11,8 @@ android {
         applicationId = "com.eartap.recorder"
         minSdk = 30          // Android 11+
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
     }
 
     // One fixed key for every build, so a new APK installs over the old one

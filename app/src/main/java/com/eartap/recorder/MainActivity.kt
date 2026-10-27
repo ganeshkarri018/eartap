@@ -6,7 +6,12 @@ import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
@@ -36,6 +41,7 @@ import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.RadioButton
 import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
@@ -48,12 +54,22 @@ import java.util.Locale
 class MainActivity : Activity() {
 
     companion object {
+        const val EXTRA_EDIT_FILE = "com.eartap.recorder.EDIT_FILE"
         private const val REQ_START = 1
         private const val REQ_LOCATION = 2
         private const val REQ_DELETE = 3
+        private const val FILTER_ALL = 0
+        private const val FILTER_INCIDENTS = 1
+        private const val FILTER_MEETINGS = 2
     }
 
-    private data class Rec(val uri: Uri, val name: String, val durationMs: Long, val addedSec: Long)
+    /** An audio file found on the phone. */
+    private data class Rec(val uri: Uri, val name: String, val durationMs: Long, val addedSec: Long, val folder: String)
+
+    /** One row on the timeline: a recording (maybe with notes) or a written note. */
+    private class Item(val time: Long, val rec: Rec?, val entry: Entry?) {
+        val category: String get() = entry?.category ?: ""
+    }
 
     private lateinit var statusChip: TextView
     private lateinit var btnRecord: View
@@ -75,6 +91,7 @@ class MainActivity : Activity() {
     private lateinit var recordingsContainer: LinearLayout
     private lateinit var recordingsCount: TextView
     private lateinit var emptyState: TextView
+    private lateinit var filterChips: List<TextView>
 
     private val handler = Handler(Looper.getMainLooper())
     private var player: MediaPlayer? = null
@@ -82,8 +99,12 @@ class MainActivity : Activity() {
     private val playIcons = mutableMapOf<Uri, ImageView>()
     private var pulse: ObjectAnimator? = null
     private var pendingAction: (() -> Unit)? = null
+    private var pendingEditFile: String? = null
+    private var pendingDelete: Item? = null
     private var updatingUi = false
     private var wasRecording = false
+    private var filter = FILTER_ALL
+    private var allItems: List<Item> = emptyList()
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -95,9 +116,10 @@ class MainActivity : Activity() {
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             refreshUi()
-            if (wasRecording != EarTapService.isRecording) {
+            val journalChanged = i.getBooleanExtra(EarTapService.EXTRA_JOURNAL, false)
+            if (journalChanged || wasRecording != EarTapService.isRecording) {
                 wasRecording = EarTapService.isRecording
-                loadRecordings()
+                loadTimeline()
             }
         }
     }
@@ -128,10 +150,23 @@ class MainActivity : Activity() {
         recordingsContainer = findViewById(R.id.recordingsContainer)
         recordingsCount = findViewById(R.id.recordingsCount)
         emptyState = findViewById(R.id.emptyState)
+        filterChips = listOf(
+            findViewById(R.id.filterAll), findViewById(R.id.filterIncidents), findViewById(R.id.filterMeetings)
+        )
 
         btnRecord.setOnClickListener {
             withPermissions { sendToService(EarTapService.ACTION_TOGGLE, foreground = true) }
         }
+        findViewById<View>(R.id.btnAddNote).setOnClickListener { openEditor(null) }
+        findViewById<View>(R.id.btnExport).setOnClickListener { exportTimeline() }
+        filterChips.forEachIndexed { index, chip ->
+            chip.setOnClickListener {
+                filter = index
+                updateFilterChips()
+                render()
+            }
+        }
+        updateFilterChips()
 
         // Meeting place
         placeInput.setText(Prefs.place(this))
@@ -202,6 +237,17 @@ class MainActivity : Activity() {
                 startActivity(Intent(Settings.ACTION_SETTINGS))
             }
         }
+
+        pendingEditFile = intent?.getStringExtra(EXTRA_EDIT_FILE)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra(EXTRA_EDIT_FILE)?.let {
+            pendingEditFile = it
+            loadTimeline()
+        }
     }
 
     override fun onStart() {
@@ -214,7 +260,7 @@ class MainActivity : Activity() {
         }
         wasRecording = EarTapService.isRecording
         refreshUi()
-        loadRecordings()
+        loadTimeline()
         handler.post(ticker)
         if (Prefs.autoPlace(this)) detectPlace(userAsked = false)
     }
@@ -283,7 +329,7 @@ class MainActivity : Activity() {
                 }
                 pendingAction = null
                 refreshUi()
-                loadRecordings()
+                loadTimeline()
             }
             REQ_LOCATION -> {
                 if (results.any { it == PackageManager.PERMISSION_GRANTED }) detectPlace(userAsked = true)
@@ -300,9 +346,9 @@ class MainActivity : Activity() {
         val starting = EarTapService.isStarting
 
         when {
-            recording -> setChip("● REC", R.drawable.bg_chip_rec, R.color.rec)
-            running -> setChip("Ready", R.drawable.bg_chip_listening, R.color.success)
-            else -> setChip("Off", R.drawable.bg_chip_idle, R.color.text_secondary)
+            recording -> setChip(statusChip, "● REC", R.drawable.bg_chip_rec, R.color.rec)
+            running -> setChip(statusChip, "Ready", R.drawable.bg_chip_listening, R.color.success)
+            else -> setChip(statusChip, "Off", R.drawable.bg_chip_idle, R.color.text_secondary)
         }
 
         recordIcon.setImageResource(if (recording || starting) R.drawable.ic_stop_white else R.drawable.ic_mic_white)
@@ -323,10 +369,22 @@ class MainActivity : Activity() {
         updateTimer()
     }
 
-    private fun setChip(text: String, bg: Int, color: Int) {
-        statusChip.text = text
-        statusChip.setBackgroundResource(bg)
-        statusChip.setTextColor(getColor(color))
+    private fun setChip(chip: TextView, text: String, bg: Int, color: Int) {
+        chip.text = text
+        chip.setBackgroundResource(bg)
+        chip.setTextColor(getColor(color))
+    }
+
+    private fun updateFilterChips() {
+        filterChips.forEachIndexed { index, chip ->
+            if (index == filter) {
+                chip.setBackgroundResource(R.drawable.bg_chip_selected)
+                chip.setTextColor(getColor(R.color.on_primary))
+            } else {
+                chip.setBackgroundResource(R.drawable.bg_chip_idle)
+                chip.setTextColor(getColor(R.color.text_secondary))
+            }
+        }
     }
 
     private fun updateFileInfo() {
@@ -428,15 +486,16 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------------------------------------------------------------- recordings list
+    // ---------------------------------------------------------------- timeline
 
-    private fun loadRecordings() {
-        val list = mutableListOf<Rec>()
+    private fun loadTimeline() {
+        val recs = mutableListOf<Rec>()
         val projection = arrayOf(
             MediaStore.Audio.Media._ID,
             MediaStore.Audio.Media.DISPLAY_NAME,
             MediaStore.Audio.Media.DURATION,
-            MediaStore.Audio.Media.DATE_ADDED
+            MediaStore.Audio.Media.DATE_ADDED,
+            MediaStore.Audio.Media.RELATIVE_PATH
         )
         try {
             contentResolver.query(
@@ -450,33 +509,57 @@ class MainActivity : Activity() {
                 val nameCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
                 val durCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
                 val addedCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
+                val pathCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.RELATIVE_PATH)
                 while (c.moveToNext()) {
                     val uri = ContentUris.withAppendedId(
                         MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, c.getLong(idCol)
                     )
-                    list += Rec(uri, c.getString(nameCol) ?: "", c.getLong(durCol), c.getLong(addedCol))
+                    recs += Rec(
+                        uri, c.getString(nameCol) ?: "", c.getLong(durCol), c.getLong(addedCol),
+                        c.getString(pathCol) ?: ""
+                    )
                 }
             }
         } catch (e: Exception) {
             toast("Could not list recordings: ${e.message}")
         }
-        render(list)
+
+        val journal = Journal.all(this)
+        val byFile = journal.filter { it.isRecording }.associateBy { it.fileName }
+        val items = mutableListOf<Item>()
+        for (r in recs) {
+            val e = byFile[r.name]
+            items += Item(e?.time?.takeIf { it > 0 } ?: (r.addedSec * 1000), r, e)
+        }
+        for (e in journal) if (!e.isRecording) items += Item(e.time, null, e)
+        allItems = items.sortedByDescending { it.time }
+        render()
+
+        pendingEditFile?.let { name ->
+            pendingEditFile = null
+            allItems.firstOrNull { it.rec?.name == name }?.let { openEditor(it) }
+        }
     }
 
-    private fun render(list: List<Rec>) {
+    private fun render() {
+        val list = when (filter) {
+            FILTER_INCIDENTS -> allItems.filter { it.category == Entry.INCIDENT }
+            FILTER_MEETINGS -> allItems.filter { it.category == Entry.MEETING }
+            else -> allItems
+        }
         recordingsContainer.removeAllViews()
         playIcons.clear()
         emptyState.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
         recordingsCount.text = when (list.size) {
             0 -> ""
-            1 -> "1 recording"
-            else -> "${list.size} recordings"
+            1 -> "1 item"
+            else -> "${list.size} items"
         }
 
         var currentDay = ""
         var card: LinearLayout? = null
-        for (rec in list) {
-            val day = dayLabel(rec.addedSec)
+        for (item in list) {
+            val day = dayLabel(item.time)
             var target = card
             if (target == null || day != currentDay) {
                 currentDay = day
@@ -500,35 +583,75 @@ class MainActivity : Activity() {
                 target.addView(divider, lp)
             }
             val row = layoutInflater.inflate(R.layout.item_recording, target, false)
-            bindRow(row, rec)
+            bindRow(row, item)
             target.addView(row)
         }
     }
 
-    private fun bindRow(row: View, rec: Rec) {
-        val p = Naming.parse(rec.name)
+    private fun bindRow(row: View, item: Item) {
         val title = row.findViewById<TextView>(R.id.title)
         val subtitle = row.findViewById<TextView>(R.id.subtitle)
+        val note = row.findViewById<TextView>(R.id.note)
+        val tag = row.findViewById<TextView>(R.id.tag)
         val playIcon = row.findViewById<ImageView>(R.id.playIcon)
+        val btnPlay = row.findViewById<View>(R.id.btnPlay)
         val btnMore = row.findViewById<View>(R.id.btnMore)
+        val e = item.entry
+        val rec = item.rec
 
-        title.text = if (p != null) "Interaction ${p.number}" else rec.name.removeSuffix(".m4a")
-        val time = p?.time ?: SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(rec.addedSec * 1000))
-        subtitle.text = listOfNotNull(time, p?.place, formatDuration(rec.durationMs)).joinToString("  ·  ")
-
-        playIcons[rec.uri] = playIcon
-        playIcon.setImageResource(if (rec.uri == playingUri) R.drawable.ic_pause else R.drawable.ic_play)
-        row.findViewById<View>(R.id.btnPlay).setOnClickListener { togglePlayback(rec.uri) }
-        row.setOnClickListener { togglePlayback(rec.uri) }
-        btnMore.setOnClickListener { showMenu(btnMore, rec) }
-        row.setOnLongClickListener {
-            showMenu(btnMore, rec)
-            true
+        if (rec != null) {
+            val p = Naming.parse(rec.name)
+            title.text = if (p != null) "Interaction ${p.number}" else rec.name.removeSuffix(".m4a")
+            val place = e?.place?.takeIf { it.isNotBlank() } ?: p?.place
+            subtitle.text = listOfNotNull(clock(item.time), place, Report.formatDuration(rec.durationMs))
+                .joinToString("  ·  ")
+            playIcons[rec.uri] = playIcon
+            playIcon.setImageResource(if (rec.uri == playingUri) R.drawable.ic_pause else R.drawable.ic_play)
+            btnPlay.setOnClickListener { togglePlayback(rec.uri) }
+            row.setOnClickListener { togglePlayback(rec.uri) }
+            btnMore.setOnClickListener { showRecordingMenu(btnMore, item) }
+            row.setOnLongClickListener {
+                showRecordingMenu(btnMore, item)
+                true
+            }
+        } else if (e != null) {
+            title.text = if (e.isMeeting) "Meeting note" else "Incident note"
+            val who = e.who.takeIf { it.isNotBlank() }?.let { "with $it" }
+            subtitle.text = listOfNotNull(clock(e.time), e.place.takeIf { it.isNotBlank() }, who)
+                .joinToString("  ·  ")
+            playIcon.setImageResource(R.drawable.ic_note)
+            btnPlay.setOnClickListener { openEditor(item) }
+            row.setOnClickListener { openEditor(item) }
+            btnMore.setOnClickListener { showNoteMenu(btnMore, item) }
+            row.setOnLongClickListener {
+                showNoteMenu(btnMore, item)
+                true
+            }
         }
+
+        when (item.category) {
+            Entry.INCIDENT -> {
+                tag.visibility = View.VISIBLE
+                setChip(tag, "INCIDENT", R.drawable.bg_chip_rec, R.color.rec)
+            }
+            Entry.MEETING -> {
+                tag.visibility = View.VISIBLE
+                setChip(tag, "MEETING", R.drawable.bg_chip_meeting, R.color.primary)
+            }
+            else -> tag.visibility = View.GONE
+        }
+        val what = e?.what.orEmpty()
+        note.visibility = if (what.isBlank()) View.GONE else View.VISIBLE
+        note.text = what
     }
 
-    private fun dayLabel(addedSec: Long): String {
-        val cal = Calendar.getInstance().apply { timeInMillis = addedSec * 1000 }
+    private fun clock(ms: Long): String = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ms))
+
+    private fun fullTime(ms: Long): String =
+        SimpleDateFormat("EEE d MMM yyyy, HH:mm", Locale.getDefault()).format(Date(ms))
+
+    private fun dayLabel(ms: Long): String {
+        val cal = Calendar.getInstance().apply { timeInMillis = ms }
         val today = Calendar.getInstance()
         val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
         val pretty = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault()).format(cal.time)
@@ -542,14 +665,301 @@ class MainActivity : Activity() {
     private fun sameDay(a: Calendar, b: Calendar) =
         a.get(Calendar.YEAR) == b.get(Calendar.YEAR) && a.get(Calendar.DAY_OF_YEAR) == b.get(Calendar.DAY_OF_YEAR)
 
-    private fun formatDuration(ms: Long): String? {
-        if (ms <= 0) return null
-        val s = ms / 1000
-        return if (s >= 3600) String.format(Locale.US, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
-               else String.format(Locale.US, "%d:%02d", s / 60, s % 60)
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /** The journal entry for an item, creating a fresh one for recordings that have none yet. */
+    private fun entryFor(item: Item): Entry {
+        item.entry?.let { return it.copy() }
+        val rec = item.rec
+        return if (rec != null) {
+            Entry(
+                kind = Entry.KIND_RECORDING,
+                fileName = rec.name,
+                folder = rec.folder,
+                time = rec.addedSec * 1000,
+                durationMs = rec.durationMs,
+                place = Naming.parse(rec.name)?.place ?: ""
+            )
+        } else {
+            Entry(kind = Entry.KIND_NOTE, category = Entry.INCIDENT, place = Prefs.place(this))
+        }
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    // ---------------------------------------------------------------- notes editor
+
+    /** item == null: new written incident note. Otherwise edit the recording's / note's details. */
+    private fun openEditor(item: Item?) {
+        val rec = item?.rec
+        val entry = if (item != null) entryFor(item)
+                    else Entry(kind = Entry.KIND_NOTE, category = Entry.INCIDENT, place = Prefs.place(this))
+        if (entry.durationMs <= 0 && rec != null) entry.durationMs = rec.durationMs
+
+        val v = layoutInflater.inflate(R.layout.dialog_entry, null)
+        val catIncident = v.findViewById<RadioButton>(R.id.catIncident)
+        val catMeeting = v.findViewById<RadioButton>(R.id.catMeeting)
+        val timeText = v.findViewById<TextView>(R.id.timeText)
+        val btnChangeTime = v.findViewById<View>(R.id.btnChangeTime)
+        val inputPlace = v.findViewById<EditText>(R.id.inputPlace)
+        val inputWho = v.findViewById<EditText>(R.id.inputWho)
+        val inputWitnesses = v.findViewById<EditText>(R.id.inputWitnesses)
+        val inputWhat = v.findViewById<EditText>(R.id.inputWhat)
+
+        when (entry.category) {
+            Entry.MEETING -> catMeeting.isChecked = true
+            Entry.INCIDENT -> catIncident.isChecked = true
+            else -> if (rec == null) catIncident.isChecked = true
+        }
+
+        var whenMs = entry.time
+        fun showTime() {
+            val length = Report.formatDuration(entry.durationMs)?.let { "  ·  $it" } ?: ""
+            timeText.text = fullTime(whenMs) + (if (rec != null) length else "")
+        }
+        showTime()
+        // A recording's time is fixed; a written note can be back-dated to when it happened
+        btnChangeTime.visibility = if (rec == null) View.VISIBLE else View.GONE
+        btnChangeTime.setOnClickListener {
+            pickDateTime(whenMs) { picked ->
+                whenMs = picked
+                showTime()
+            }
+        }
+
+        inputPlace.setText(entry.place)
+        inputWho.setText(entry.who)
+        inputWitnesses.setText(entry.witnesses)
+        inputWhat.setText(entry.what)
+
+        val title = when {
+            rec != null -> Naming.parse(rec.name)?.let { "Interaction ${it.number}" } ?: rec.name
+            item == null -> "New incident note"
+            else -> "Edit note"
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(v)
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null)
+        if (item != null && rec == null) builder.setNeutralButton("Delete", null)
+        val dialog = builder.create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val what = inputWhat.text.toString().trim()
+                if (rec == null && what.isEmpty()) {
+                    inputWhat.error = "Write what happened"
+                    return@setOnClickListener
+                }
+                entry.category = when {
+                    catIncident.isChecked -> Entry.INCIDENT
+                    catMeeting.isChecked -> Entry.MEETING
+                    else -> ""
+                }
+                entry.time = whenMs
+                entry.place = inputPlace.text.toString().trim()
+                entry.who = inputWho.text.toString().trim()
+                entry.witnesses = inputWitnesses.text.toString().trim()
+                entry.what = what
+                Journal.upsert(this, entry)
+                dialog.dismiss()
+                loadTimeline()
+                toast("Saved")
+            }
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+                confirmDeleteNote(entry) { dialog.dismiss() }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun pickDateTime(initial: Long, onPicked: (Long) -> Unit) {
+        val cal = Calendar.getInstance().apply { timeInMillis = initial }
+        DatePickerDialog(this, { _, y, m, d ->
+            TimePickerDialog(this, { _, h, min ->
+                cal.set(y, m, d, h, min, 0)
+                onPicked(cal.timeInMillis)
+            }, cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE), true).show()
+        }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).show()
+    }
+
+    private fun confirmDeleteNote(entry: Entry, after: () -> Unit = {}) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete this note?")
+            .setMessage("The written note will be removed. This can't be undone.")
+            .setPositiveButton("Delete") { _, _ ->
+                Journal.delete(this, entry.id)
+                after()
+                loadTimeline()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---------------------------------------------------------------- menus
+
+    private fun showRecordingMenu(anchor: View, item: Item) {
+        val hasNotes = item.entry?.let { it.category.isNotEmpty() || it.what.isNotBlank() } == true
+        PopupMenu(this, anchor).apply {
+            menu.add(0, 1, 0, if (hasNotes) "Edit tag & note" else "Add tag & note")
+            menu.add(0, 2, 1, "Evidence details")
+            menu.add(0, 3, 2, "Share")
+            menu.add(0, 4, 3, "Delete")
+            setOnMenuItemClickListener { mi ->
+                when (mi.itemId) {
+                    1 -> openEditor(item)
+                    2 -> showEvidence(item)
+                    3 -> item.rec?.let { share(it.uri, "audio/mp4", it.name.removeSuffix(".m4a")) }
+                    4 -> deleteRecording(item)
+                }
+                true
+            }
+            show()
+        }
+    }
+
+    private fun showNoteMenu(anchor: View, item: Item) {
+        val e = item.entry ?: return
+        PopupMenu(this, anchor).apply {
+            menu.add(0, 1, 0, "Edit")
+            menu.add(0, 2, 1, "Delete")
+            setOnMenuItemClickListener { mi ->
+                when (mi.itemId) {
+                    1 -> openEditor(item)
+                    2 -> confirmDeleteNote(e)
+                }
+                true
+            }
+            show()
+        }
+    }
+
+    // ---------------------------------------------------------------- evidence details
+
+    private fun showEvidence(item: Item) {
+        val rec = item.rec ?: return
+        val e = item.entry
+        val base = buildString {
+            appendLine("File: ${rec.name}")
+            appendLine("Folder: ${rec.folder.trimEnd('/')}")
+            if (e != null && e.endTime > e.time) {
+                appendLine("Recorded: ${fullTime(e.time)} – ${clock(e.endTime)}")
+            } else {
+                appendLine("Saved: ${fullTime(rec.addedSec * 1000)}")
+            }
+            Report.formatDuration(rec.durationMs)?.let { appendLine("Length: $it") }
+            if (e != null && e.sizeBytes > 0) appendLine("Size: ${e.sizeBytes} bytes")
+            if (e != null && e.device.isNotBlank()) appendLine("Phone: ${e.device}")
+            if (e != null && e.sha256.isNotBlank()) {
+                appendLine()
+                appendLine("SHA-256 fingerprint, taken ${fullTime(e.hashedAt)}:")
+                append(e.sha256)
+            }
+        }.trim()
+        var copyText = base
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Evidence details")
+            .setMessage("$base\n\nChecking the file…")
+            .setPositiveButton("OK", null)
+            .setNeutralButton("Copy", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                getSystemService(ClipboardManager::class.java)
+                    .setPrimaryClip(ClipData.newPlainText("EarTap evidence", copyText))
+                toast("Copied")
+            }
+        }
+        dialog.show()
+
+        Thread {
+            val now = Integrity.sha256(contentResolver, rec.uri)
+            var journalChanged = false
+            val result = when {
+                now == null -> "Couldn't read the file to check it."
+                e != null && e.sha256.isNotBlank() ->
+                    if (now.first == e.sha256) "✓ Unchanged: the file still matches the fingerprint taken when it was saved."
+                    else "✗ Changed: the file no longer matches its saved fingerprint."
+                else -> {
+                    val fresh = entryFor(item)
+                    fresh.sha256 = now.first
+                    fresh.sizeBytes = now.second
+                    fresh.hashedAt = System.currentTimeMillis()
+                    if (fresh.device.isBlank()) fresh.device = Integrity.deviceInfo()
+                    Journal.upsert(this, fresh)
+                    journalChanged = true
+                    "No fingerprint was saved when this was recorded (older EarTap version). " +
+                        "A fingerprint has been taken now:\n${now.first}"
+                }
+            }
+            runOnUiThread {
+                copyText = "$base\n\n$result"
+                if (dialog.isShowing) dialog.setMessage(copyText)
+                if (journalChanged) loadTimeline()
+            }
+        }.start()
+    }
+
+    // ---------------------------------------------------------------- export
+
+    private fun exportTimeline() {
+        AlertDialog.Builder(this)
+            .setTitle("Export timeline as PDF")
+            .setItems(arrayOf("Incidents only", "Everything (incidents, meetings, untagged)")) { _, which ->
+                makeReport(incidentsOnly = which == 0)
+            }
+            .show()
+    }
+
+    private fun makeReport(incidentsOnly: Boolean) {
+        val entries = allItems.map { item ->
+            entryFor(item).also { e ->
+                val rec = item.rec
+                if (rec != null) {
+                    if (e.durationMs <= 0) e.durationMs = rec.durationMs
+                    if (e.folder.isBlank()) e.folder = rec.folder
+                }
+            }
+        }.filter { !incidentsOnly || it.isIncident }.sortedBy { it.time }
+
+        if (entries.isEmpty()) {
+            toast(
+                if (incidentsOnly) "No incidents yet — tag a recording as Incident or write an incident note"
+                else "Nothing to export yet"
+            )
+            return
+        }
+        toast("Creating report…")
+        Thread {
+            val uri: Uri? = try {
+                Report.save(this, entries, incidentsOnly)
+            } catch (e: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (uri == null) toast("Couldn't create the report") else reportDone(uri)
+            }
+        }.start()
+    }
+
+    private fun reportDone(uri: Uri) {
+        AlertDialog.Builder(this)
+            .setTitle("Report saved")
+            .setMessage("Saved as a PDF in ${Report.FOLDER}.\n\nShare it with HR or a lawyer, or keep it with your records.")
+            .setPositiveButton("Share") { _, _ -> share(uri, "application/pdf", "EarTap timeline") }
+            .setNeutralButton("Open") { _, _ ->
+                try {
+                    startActivity(
+                        Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/pdf")
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    )
+                } catch (e: Exception) {
+                    toast("No PDF viewer found — use Share instead")
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
 
     // ---------------------------------------------------------------- playback / share / delete
 
@@ -587,37 +997,25 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showMenu(anchor: View, rec: Rec) {
-        PopupMenu(this, anchor).apply {
-            menu.add(0, 1, 0, "Share")
-            menu.add(0, 2, 1, "Delete")
-            setOnMenuItemClickListener { item ->
-                when (item.itemId) {
-                    1 -> share(rec)
-                    2 -> delete(rec)
-                }
-                true
-            }
-            show()
-        }
-    }
-
-    private fun share(rec: Rec) {
+    private fun share(uri: Uri, type: String, subject: String) {
         val send = Intent(Intent.ACTION_SEND)
-            .setType("audio/mp4")
-            .putExtra(Intent.EXTRA_STREAM, rec.uri)
-            .putExtra(Intent.EXTRA_SUBJECT, rec.name.removeSuffix(".m4a"))
+            .setType(type)
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .putExtra(Intent.EXTRA_SUBJECT, subject)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        startActivity(Intent.createChooser(send, "Share recording"))
+        startActivity(Intent.createChooser(send, "Share"))
     }
 
-    private fun delete(rec: Rec) {
+    private fun deleteRecording(item: Item) {
+        val rec = item.rec ?: return
         if (playingUri == rec.uri) stopPlayback()
         try {
             // Android shows its own "Allow EarTap to delete?" confirmation
             val request = MediaStore.createDeleteRequest(contentResolver, listOf(rec.uri))
+            pendingDelete = item
             startIntentSenderForResult(request.intentSender, REQ_DELETE, null, 0, 0, 0)
         } catch (e: Exception) {
+            pendingDelete = null
             toast("Couldn't delete — remove it from your Files app")
         }
     }
@@ -625,7 +1023,25 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_DELETE) loadRecordings()
+        if (requestCode == REQ_DELETE) {
+            val deleted = pendingDelete
+            pendingDelete = null
+            if (resultCode == RESULT_OK && deleted != null) {
+                val e = deleted.entry
+                if (e != null) {
+                    if (e.what.isBlank() && e.who.isBlank() && e.witnesses.isBlank()) {
+                        Journal.delete(this, e.id)
+                    } else {
+                        // Keep the written note even though the audio is gone
+                        e.kind = Entry.KIND_NOTE
+                        e.what = e.what + "\n\n(Audio file ${e.fileName} was deleted.)"
+                        e.fileName = ""
+                        Journal.upsert(this, e)
+                    }
+                }
+            }
+            loadTimeline()
+        }
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
