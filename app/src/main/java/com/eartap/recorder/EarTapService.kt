@@ -59,6 +59,7 @@ class EarTapService : Service() {
 
         @Volatile var isRunning = false
         @Volatile var isRecording = false
+        @Volatile var lastKey = "none yet"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -92,6 +93,7 @@ class EarTapService : Service() {
         if (intent?.action == ACTION_STOP) {
             isRunning = false
             stopRecording()
+            stopSilentLoop()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -108,6 +110,7 @@ class EarTapService : Service() {
     override fun onDestroy() {
         isRunning = false
         stopRecording()
+        stopSilentLoop()
         session.isActive = false
         session.release()
         tone?.release()
@@ -125,6 +128,11 @@ class EarTapService : Service() {
             } else {
                 @Suppress("DEPRECATION")
                 mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+            }
+            if (ev != null) {
+                lastKey = KeyEvent.keyCodeToString(ev.keyCode) +
+                    (if (ev.action == KeyEvent.ACTION_DOWN) " (down)" else " (up)")
+                broadcastState()
             }
             if (ev != null && isTrigger(ev.keyCode)) {
                 Log.d(TAG, "Trigger key ${KeyEvent.keyCodeToString(ev.keyCode)} action=${ev.action}")
@@ -157,16 +165,20 @@ class EarTapService : Service() {
             .setState(PlaybackState.STATE_PLAYING, 0L, 1f)
             .build()
 
+    private var silentTrack: AudioTrack? = null
+
     /**
-     * Android sends earbud buttons to the app that played audio most recently.
-     * Playing half a second of silence makes EarTap that app.
+     * Android sends earbud buttons to the app that is playing audio right now.
+     * So EarTap plays an inaudible looping sound the whole time it is listening.
      */
     private fun claimMediaButtons() {
         session.setPlaybackState(playingState())
         session.isActive = true
+        if (silentTrack != null) return
         try {
             val rate = 8000
-            val samples = rate / 2
+            val samples = rate
+            val data = ShortArray(samples) { i -> if (i % 2 == 0) 1.toShort() else (-1).toShort() }
             val track = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -184,15 +196,19 @@ class EarTapService : Service() {
                 .setBufferSizeInBytes(samples * 2)
                 .setTransferMode(AudioTrack.MODE_STATIC)
                 .build()
-            track.write(ShortArray(samples), 0, samples)
+            track.write(data, 0, samples)
+            track.setLoopPoints(0, samples, -1)
             track.play()
-            handler.postDelayed({
-                try { track.stop() } catch (_: Exception) {}
-                track.release()
-            }, 1000)
+            silentTrack = track
         } catch (e: Exception) {
             Log.w(TAG, "Silent playback failed", e)
         }
+    }
+
+    private fun stopSilentLoop() {
+        try { silentTrack?.stop() } catch (_: Exception) {}
+        try { silentTrack?.release() } catch (_: Exception) {}
+        silentTrack = null
     }
 
     // ---------------------------------------------------------------- recording

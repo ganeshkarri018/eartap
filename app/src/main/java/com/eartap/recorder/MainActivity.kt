@@ -145,11 +145,12 @@ class MainActivity : Activity() {
     }
 
     private fun refreshUi() {
-        status.text = when {
+        val state = when {
             EarTapService.isRecording -> "● Recording"
             EarTapService.isRunning -> "Listening for earbud taps"
             else -> "Off"
         }
+        status.text = state + "\nLast earbud button: " + EarTapService.lastKey
         btnService.text = if (EarTapService.isRunning) "Stop listening" else "Start listening"
         btnRecord.text = if (EarTapService.isRecording) "Stop recording" else "Record now (test)"
     }
